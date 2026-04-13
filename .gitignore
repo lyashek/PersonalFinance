@@ -1,27 +1,25 @@
 ```
-# Python
+# Dependencies
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Dependencies
-node_modules/
-
-# Environment
+.Python
+venv/
+.venv/
 .env
 .env.local
 .env.*
 
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
 # Logs
 *.log
 
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# IDE
+# Editor/IDE
 .vscode/
 .idea/
 *.swp
@@ -31,4 +29,13 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
 ```

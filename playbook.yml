@@ -1,0 +1,259 @@
+---
+- name: Deploy Bank Accounts Service
+  hosts: all
+  become: true
+  vars:
+    app_user: bankapp
+    app_group: bankapp
+    app_dir: /opt/bankapp
+    python_version: "3.13"
+    venv_dir: "{{ app_dir }}/venv"
+    backend_port: 8000
+    frontend_port: 5173
+
+  tasks:
+    - name: Install required system packages
+      apt:
+        name:
+          - python3.13
+          - python3.13-venv
+          - python3-pip
+          - nodejs
+          - npm
+          - git
+          - nginx
+          - curl
+          - build-essential
+        state: present
+        update_cache: yes
+
+    - name: Create application group
+      group:
+        name: "{{ app_group }}"
+        state: present
+
+    - name: Create application user
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        home: "{{ app_dir }}"
+        shell: /bin/bash
+        system: yes
+        create_home: no
+
+    - name: Create application directory
+      file:
+        path: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0755'
+        state: directory
+
+    - name: Copy application files
+      copy:
+        src: "{{ item }}"
+        dest: "{{ app_dir }}/"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0644'
+      loop:
+        - main.py
+        - config.py
+        - database.py
+        - models.py
+        - schemas.py
+        - crud.py
+        - api.py
+        - requirements.txt
+      ignore_errors: yes
+
+    - name: Copy frontend files
+      copy:
+        src: frontend/
+        dest: "{{ app_dir }}/frontend/"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0644'
+      ignore_errors: yes
+
+    - name: Create init_db script
+      copy:
+        content: |
+          #!/usr/bin/env python3
+          import sys
+          sys.path.insert(0, '{{ app_dir }}')
+          from database import Base, engine
+          print("Creating database tables...")
+          Base.metadata.create_all(bind=engine)
+          print("Database initialized successfully!")
+        dest: "{{ app_dir }}/init_db.py"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0644'
+
+    - name: Create Python virtual environment
+      command: python3.13 -m venv {{ venv_dir }}
+      args:
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: Create requirements.txt if not exists
+      copy:
+        content: |
+          fastapi==0.115.0
+          uvicorn[standard]==0.32.0
+          sqlalchemy==2.0.35
+          pydantic==2.9.2
+          pydantic-settings==2.6.0
+          python-multipart==0.0.12
+        dest: "{{ app_dir }}/requirements.txt"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0644'
+
+    - name: Install Python dependencies
+      pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ venv_dir }}"
+        executable: "{{ venv_dir }}/bin/pip"
+
+    - name: Initialize database
+      command: "{{ venv_dir }}/bin/python {{ app_dir }}/init_db.py"
+      become_user: "{{ app_user }}"
+      args:
+        chdir: "{{ app_dir }}"
+
+    - name: Install Node.js dependencies for frontend
+      command: npm install
+      args:
+        chdir: "{{ app_dir }}/frontend"
+      become_user: "{{ app_user }}"
+
+    - name: Build frontend
+      command: npm run build
+      args:
+        chdir: "{{ app_dir }}/frontend"
+      become_user: "{{ app_user }}"
+      environment:
+        NODE_ENV: production
+
+    - name: Create systemd service for backend
+      copy:
+        content: |
+          [Unit]
+          Description=Bank Accounts Backend API
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}
+          Environment="PATH={{ venv_dir }}/bin"
+          ExecStart={{ venv_dir }}/bin/uvicorn main:app --host 0.0.0.0 --port {{ backend_port }}
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/bankapp-backend.service
+        mode: '0644'
+
+    - name: Create systemd service for frontend (optional, if using serve)
+      copy:
+        content: |
+          [Unit]
+          Description=Bank Accounts Frontend Dev Server
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}/frontend
+          ExecStart=/usr/bin/npm run preview -- --host 0.0.0.0 --port {{ frontend_port }}
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/bankapp-frontend.service
+        mode: '0644'
+      when: false  # Disabled by default, use Nginx for static files instead
+
+    - name: Configure Nginx for frontend and API proxy
+      copy:
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              root {{ app_dir }}/frontend/dist;
+              index index.html;
+
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+
+              location /api {
+                  proxy_pass http://127.0.0.1:{{ backend_port }};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location /docs {
+                  proxy_pass http://127.0.0.1:{{ backend_port }}/docs;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              location /openapi.json {
+                  proxy_pass http://127.0.0.1:{{ backend_port }}/openapi.json;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+        dest: /etc/nginx/sites-available/bankapp
+        mode: '0644'
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/bankapp
+        dest: /etc/nginx/sites-enabled/bankapp
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start backend service
+      systemd:
+        name: bankapp-backend
+        enabled: yes
+        state: started
+
+    - name: Test Nginx configuration
+      command: nginx -t
+
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+    - name: Display deployment information
+      debug:
+        msg: |
+          Deployment completed successfully!
+          
+          Backend API: http://{{ ansible_host }}:{{ backend_port }}
+          Frontend: http://{{ ansible_host }}
+          API Documentation: http://{{ ansible_host }}/docs
+          
+          Services status:
+          - Backend: active (systemd: bankapp-backend)
+          - Frontend: served via Nginx
